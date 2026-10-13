@@ -43,7 +43,7 @@ func LinkPublicURL() (*url.URL, error) {
 	u, _ = url.Parse(normalized) // NormalizeOrigin has already validated this URL.
 	ip := net.ParseIP(u.Hostname())
 	loopback := u.Hostname() == "localhost" || (ip != nil && ip.IsLoopback())
-	if u.Scheme != "https" && !(u.Scheme == "http" && loopback) {
+	if u.Scheme != "https" && !(u.Scheme == "http" && loopback) && normalized != common.LinkInsecureTestOrigin() {
 		return nil, model.LinkFailure(503, "LINK_NOT_CONFIGURED", "Client authorization requires HTTPS")
 	}
 	u.Path = ""

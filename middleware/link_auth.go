@@ -15,6 +15,7 @@ import (
 
 // LinkTransport checks the actual peer rather than Gin's forwarded client address.
 func LinkTransport() gin.HandlerFunc {
+	insecureTestOrigin := common.LinkInsecureTestOrigin()
 	trustedProxies, defaults, err := common.ResolveTrustedProxies(os.Getenv("TRUSTED_PROXIES"))
 	if defaults {
 		// Sensitive desktop credentials do not inherit the gateway's broad
@@ -60,7 +61,14 @@ func LinkTransport() gin.HandlerFunc {
 		trustedTLS := len(forwarded) == 1 && forwarded[0] == "https" && slices.ContainsFunc(trustedNetworks, func(network *net.IPNet) bool {
 			return network.Contains(ip)
 		})
-		if c.Request.TLS == nil && !(local && localHost) && !trustedTLS {
+		// This opt-in exception uses the actual Host, never forwarded host or
+		// protocol headers. It is intentionally restricted to one test origin.
+		insecureTestRequest := false
+		if insecureTestOrigin != "" && !strings.ContainsAny(c.Request.Host, "/?#@") && !strings.HasSuffix(c.Request.Host, ":") {
+			requestOrigin, err := common.NormalizeOrigin("http://" + c.Request.Host)
+			insecureTestRequest = err == nil && requestOrigin == insecureTestOrigin
+		}
+		if c.Request.TLS == nil && !(local && localHost) && !trustedTLS && !insecureTestRequest {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"success": false, "code": "LINK_TLS_REQUIRED", "message": "HTTPS is required", "message_key": "HTTPS is required"})
 			return
 		}
