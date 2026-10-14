@@ -203,7 +203,7 @@ type LinkCatalog struct {
 }
 
 func ValidLinkTool(tool string) bool {
-	return tool == "codex" || tool == "claude_code" || tool == "claude_desktop" || tool == "hermes"
+	return tool == "codex" || tool == "claude_code" || tool == "claude_desktop" || tool == "hermes" || tool == "workbuddy"
 }
 func GetLinkCatalog(userID int, tool, group string) (*LinkCatalog, error) {
 	user, err := model.GetSelfUserById(userID)
@@ -244,7 +244,7 @@ func linkCatalogForUser(tx *gorm.DB, user *model.User, tool, group string) (*Lin
 	switch tool {
 	case "codex":
 		protocol = "openai_responses"
-	case "hermes":
+	case "hermes", "workbuddy":
 		protocol = "openai_chat_completions"
 	}
 	seen := map[string]bool{}

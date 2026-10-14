@@ -322,6 +322,91 @@ func testLinkAuthorizationGuards(t *testing.T, db *gorm.DB, router *gin.Engine, 
 	}
 }
 
+func testLinkWorkBuddyWorkflow(t *testing.T, db *gorm.DB, client, otherDevice, otherUser *linkTestClient) {
+	t.Helper()
+	catalogPath := filepath.Join(t.TempDir(), "workbuddy-catalog.json")
+	entries := []gin.H{
+		{"id": "verified-second", "protocol": "openai_chat_completions", "tool_families": []string{"workbuddy"}, "groups": []string{"default", "vip"}, "metadata": gin.H{"workbuddy": gin.H{"supportsToolCall": true, "supportsImages": false, "supportsReasoning": false, "maxInputTokens": 8192}}},
+		{"id": "verified-model", "protocol": "openai_chat_completions", "tool_families": []string{"workbuddy", "hermes"}, "groups": []string{"default", "vip"}},
+		{"id": "not-on-channel", "protocol": "openai_chat_completions", "tool_families": []string{"workbuddy"}, "groups": []string{"default", "vip"}},
+	}
+	raw, err := common.Marshal(gin.H{"models": entries})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(catalogPath, raw, 0600))
+	t.Setenv("LINK_MODEL_CATALOG_FILE", catalogPath)
+	catalog := client.request("GET", "/catalog?tool_family=workbuddy&group=default", nil, 200)
+	assert.Equal(t, "workbuddy", catalog.Data["tool_family"])
+	assert.Equal(t, "verified-second", catalog.Data["default_model"])
+	models := catalog.Data["models"].([]any)
+	require.Len(t, models, 2)
+	for _, item := range models {
+		assert.Equal(t, "openai_chat_completions", item.(map[string]any)["protocol"])
+	}
+	assert.Equal(t, map[string]any{"workbuddy": map[string]any{"supportsToolCall": true, "supportsImages": false, "supportsReasoning": false, "maxInputTokens": float64(8192)}}, models[0].(map[string]any)["metadata"], "verified capability metadata must reach the adapter unchanged")
+	hermesCatalog := client.request("GET", "/catalog?tool_family=hermes&group=default", nil, 200)
+	assert.Len(t, hermesCatalog.Data["models"], 1, "shared protocol does not imply shared tool compatibility")
+	assert.NotEqual(t, catalog.Data["revision"], hermesCatalog.Data["revision"])
+	entries[0]["protocol"] = "openai_responses"
+	invalid, err := common.Marshal(gin.H{"models": entries})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(catalogPath, invalid, 0600))
+	assert.Equal(t, "LINK_CATALOG_UNAVAILABLE", client.request("GET", "/catalog?tool_family=workbuddy&group=default", nil, 503).Code)
+	require.NoError(t, os.WriteFile(catalogPath, raw, 0600))
+
+	hermesCreated := client.request("POST", "/connections", gin.H{"operation_id": uuid.NewString(), "tool_family": "hermes", "config_scope": "default", "group": "default", "models": []string{"verified-model"}, "default_model": "verified-model", "catalog_revision": hermesCatalog.Data["revision"]}, 200)
+	hermesConn := linkConnectionFrom(t, linkAction(t, client, linkConnectionFrom(t, hermesCreated), "commit", nil))
+	create := gin.H{"operation_id": uuid.NewString(), "tool_family": "workbuddy", "config_scope": "default", "group": "default", "models": []string{"verified-model", "verified-second"}, "default_model": "verified-second", "catalog_revision": catalog.Data["revision"]}
+	created := client.request("POST", "/connections", create, 200)
+	retried := client.request("POST", "/connections", create, 200)
+	assert.Equal(t, created.Data["token_id"], retried.Data["token_id"])
+	assert.Equal(t, created.Data["api_key"], retried.Data["api_key"])
+	conn := linkConnectionFrom(t, linkAction(t, client, linkConnectionFrom(t, created), "commit", nil))
+	assert.Equal(t, "workbuddy", conn["tool_family"])
+	assert.NotEqual(t, hermesConn["id"], conn["id"], "same device and config scope must keep independent tool connections")
+	assert.NotEqual(t, hermesCreated.Data["token_id"], created.Data["token_id"])
+	tokenID := int(created.Data["token_id"].(float64))
+	endpoint := "/connections/" + conn["id"].(string)
+	for _, unauthorized := range []*linkTestClient{otherDevice, otherUser} {
+		unauthorized.request("GET", endpoint, nil, 404)
+		unauthorized.request("GET", "/operations/"+create["operation_id"].(string), nil, 404)
+		unauthorized.request("POST", endpoint+"/actions", gin.H{"operation_id": uuid.NewString(), "action": "disconnect", "expected_revision": conn["revision"]}, 404)
+	}
+	// No trusted WorkBuddy executor exists; a management session cannot claim a tool run.
+	client.request("POST", endpoint+"/tool-verifications", gin.H{"expected_revision": conn["revision"], "target": "workbuddy", "model": "verified-second", "protocol": "openai_chat_completions"}, 400)
+	client.request("POST", endpoint+"/tool-verifications", gin.H{"expected_revision": conn["revision"], "target": "hermes", "model": "verified-second", "protocol": "openai_chat_completions"}, 409)
+	conn = linkConnectionFrom(t, linkAction(t, client, conn, "pause", nil))
+	assert.Equal(t, "paused", conn["status"])
+	conn = linkConnectionFrom(t, linkAction(t, client, conn, "resume", nil))
+	assert.Equal(t, "active", conn["status"])
+	vip := client.request("GET", "/catalog?tool_family=workbuddy&group=vip", nil, 200)
+	prepared := linkAction(t, client, conn, "prepare_switch", gin.H{"group": "vip", "models": []string{"verified-model"}, "default_model": "verified-model", "catalog_revision": vip.Data["revision"]})
+	conn = linkConnectionFrom(t, prepared)
+	candidateID := int(prepared.Data["token_id"].(float64))
+	assert.NotEqual(t, tokenID, candidateID)
+	var original, candidate model.Token
+	require.NoError(t, db.First(&original, tokenID).Error)
+	assert.Equal(t, common.TokenStatusEnabled, original.Status, "old key remains usable until switch commits")
+	conn = linkConnectionFrom(t, linkAction(t, client, conn, "commit", nil))
+	require.NoError(t, db.First(&original, tokenID).Error)
+	require.NoError(t, db.First(&candidate, candidateID).Error)
+	assert.Equal(t, "default", original.Group)
+	assert.Equal(t, common.TokenStatusDisabled, original.Status)
+	assert.Equal(t, "vip", candidate.Group)
+	assert.Equal(t, common.TokenStatusEnabled, candidate.Status)
+	assert.True(t, candidate.UnlimitedQuota)
+	assert.Equal(t, int64(-1), candidate.ExpiredTime)
+	assert.False(t, candidate.ModelLimitsEnabled)
+	conn = linkConnectionFrom(t, linkAction(t, client, conn, "disconnect", nil))
+	assert.Equal(t, "disconnected", conn["status"])
+	require.NoError(t, db.First(&candidate, candidateID).Error)
+	assert.Equal(t, common.TokenStatusDisabled, candidate.Status)
+	var hermesToken model.Token
+	require.NoError(t, db.First(&hermesToken, int(hermesCreated.Data["token_id"].(float64))).Error)
+	assert.Equal(t, common.TokenStatusEnabled, hermesToken.Status, "WorkBuddy lifecycle cannot disable another tool's key")
+	assert.Equal(t, "active", client.request("GET", "/connections/"+hermesConn["id"].(string), nil, 200).Data["status"])
+	linkAction(t, client, hermesConn, "disconnect", nil)
+}
+
 func TestLinkAPIWorkflowAndDatabaseCompatibility(t *testing.T) {
 	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
 		t.Run(dialect, func(t *testing.T) {
@@ -525,6 +610,9 @@ func TestLinkAPIWorkflowAndDatabaseCompatibility(t *testing.T) {
 			testLinkToolVerification(t, db, client, secondDevice, otherClient, conn, user.Id, firstID, "codex-cli", "openai_responses", "/v1/responses")
 			t.Run("hermes", func(t *testing.T) {
 				testLinkHermesWorkflow(t, db, client, secondDevice, otherClient, user.Id)
+			})
+			t.Run("workbuddy", func(t *testing.T) {
+				testLinkWorkBuddyWorkflow(t, db, client, secondDevice, otherClient)
 			})
 			updatedModels := linkAction(t, client, conn, "update_models", gin.H{"models": []string{"verified-model", "verified-second"}, "default_model": "verified-second", "catalog_revision": catalogResult.Data["revision"]})
 			conn = linkConnectionFrom(t, updatedModels)

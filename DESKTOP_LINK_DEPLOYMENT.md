@@ -69,12 +69,30 @@ SESSION_COOKIE_TRUSTED_URL=
       "tool_families": ["hermes"],
       "groups": ["REPLACE_WITH_PLATFORM_GROUP"],
       "metadata": {}
+    },
+    {
+      "id": "REPLACE_WITH_VERIFIED_WORKBUDDY_MODEL_ID",
+      "label": "REPLACE_WITH_WORKBUDDY_MODEL_LABEL",
+      "protocol": "openai_chat_completions",
+      "tool_families": ["workbuddy"],
+      "groups": ["REPLACE_WITH_PLATFORM_GROUP"],
+      "metadata": {
+        "workbuddy": {
+          "supportsToolCall": true,
+          "supportsImages": false,
+          "supportsReasoning": false
+        }
+      }
     }
   ]
 }
 ```
 
-字段含义：`revision`（目录标记）、`models`（模型数组）、`id`（平台模型编号）、`label`（显示名）、`protocol`（协议）、`tool_families`（适用工具）、`groups`（价格组）、`metadata`（工具元数据）。示例协议为聊天补全，工具为 Hermes（智能体）。
+字段含义：`revision`（目录标记）、`models`（模型数组）、`id`（平台模型编号）、`label`（显示名）、`protocol`（协议）、`tool_families`（适用工具）、`groups`（价格组）、`metadata`（工具元数据）。示例协议为聊天补全，分别为 Hermes（智能体）和 WorkBuddy（腾讯工作助手）声明已验证资源。只有同一模型已在两个工具分别验证，才能将工具数组合并为 `["hermes", "workbuddy"]`；不要为同一工具及组重复填写同一模型编号。
+
+`metadata.workbuddy`（工作助手能力元数据）必须按实际验证填写：`supportsToolCall`（工具调用支持）须为 `true`（支持），`supportsImages`（图像支持）与 `supportsReasoning`（推理支持）为明确布尔值。可选 `maxInputTokens`（最大输入令牌数）与 `maxOutputTokens`（最大输出令牌数）须为实际支持的正整数。以上只是字段模板，不声明 `glm-5.2`（候选模型）已经具备任何相应能力；不清楚的可选限制不填写，不根据模型名猜测。
+
+后台工具族支持 `codex`（编程助手）、`claude_code`（编程命令行）、`claude_desktop`（桌面助手）、`hermes`（智能体）和 `workbuddy`（腾讯工作助手）。后两者使用相同聊天补全协议，连接和密钥仍分别归属，不能用一种工具的身份创建另一种工具的连接。WorkBuddy（腾讯工作助手）没有受信任的自动执行验证器，因此不提供其实际工具调用回执；接口连通不能代替在该应用中完成真实任务的验收。
 
 现有候选资源是 `glm-5.2`（模型编号）。先用原平台的测试账号验证该资源在目标组的普通响应、流式和工具调用，再填写实际目录；仅凭名称不能声明兼容。其他工具需要对应协议与元数据，不能把全部平台模型直接暴露给所有工具。未配置目录或没有符合条件的模型时，接入接口明确返回不可用，不自动创建替代资源。
 
@@ -82,7 +100,7 @@ SESSION_COOKIE_TRUSTED_URL=
 
 1. 确认原网页登录、多因素认证、原生密钥列表及已有模型调用正常，原余额和用量保留。
 2. 桌面打开系统浏览器登录；成功返回客户端。网页访问凭据不交给客户端，客户端只取得受限管理会话。
-3. 选择组和模型，接入 Hermes（智能体）；新密钥在原网页列表可见，实际消费计入原钱包与该密钥。
+3. 选择组和模型，分别接入 Hermes（智能体）或 WorkBuddy（腾讯工作助手）；新密钥在原网页列表可见，实际消费计入原钱包与该密钥。WorkBuddy（腾讯工作助手）需在应用中实际发起任务，检查流式结果和工具调用；不能把后台接口验证标成工具调用成功。
 4. 暂停后新调用被拒绝；启用遵守网页额度、有效期和模型限制，不自动放宽限制。
 5. 切组创建独立新密钥，新密钥采用平台默认规则；客户端确认页说明不继承旧限制。提交成功后停旧密钥，保留原组及消费统计。
 6. 退出客户端后工具仍能调用；断开连接时停密钥并由客户端恢复原配置。登录其他账号不能管理旧账号或其他设备的连接。
@@ -116,3 +134,5 @@ go build ./...
 迁移探针、桌面联调脚本和日志保留在桌面项目工作区，未将私有测试数据提交到本仓库。部署后的真实模型、公开入口、代理链及已有服务器数据仍须按上述步骤验收；本机合成模型测试不能替代这些结论。
 
 本次追加的明文例外未改数据库或计费。专项覆盖默认拒绝、唯一测试源、错主机/端口、双配置不一致、非法来源、转发头伪造及授权地址生成，并回归原可信代理与会话来源检查；不将测试例外描述为安全合规。
+
+2026-10-14（本机验证日期）追加 WorkBuddy（腾讯工作助手）独立工具族：未改数据结构、依赖、认证机制、计费或自动工具执行接口。使用上述三个版本的真实数据库执行 `go test ./controller -run '^TestLinkAPIWorkflowAndDatabaseCompatibility$' -count=1 -v`（连接工作流和三库回归），全部通过、没有跳过；覆盖与同设备另一工具独立建连、目录协议拒绝、能力元数据透传、账号和设备隔离、重复创建、停启、切组新建停旧及断开后另一工具密钥保持有效。`go build ./...`（后台完整构建）通过。本轮未重跑完整平台初始化或网页回归；WorkBuddy（腾讯工作助手）真实模型任务仍须部署后验收。
