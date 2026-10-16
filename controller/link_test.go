@@ -442,8 +442,8 @@ func testLinkLiveToolCatalogs(t *testing.T, db *gorm.DB, client *linkTestClient)
 		{"claude-group-isolated", "default", "", "", constant.ChannelTypeOpenAI, common.ChannelStatusEnabled, true, true, true},
 		{"claude-chat-only", "default", "", `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/chat/completions","upstream_path":"/chat"}]}}`, constant.ChannelTypeAdvancedCustom, common.ChannelStatusEnabled, false, false, true},
 		{"claude-route", "default", "", `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/messages","upstream_path":"/messages"}]}}`, constant.ChannelTypeAdvancedCustom, common.ChannelStatusEnabled, true, true, false},
-		{"claude-converted-route", "default", "", `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/messages","upstream_path":"/chat","converter":"claude_messages_to_openai_chat"}]}}`, constant.ChannelTypeAdvancedCustom, common.ChannelStatusEnabled, true, true, false},
-		{"claude-blocked-route", "default", passthrough, `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/messages","upstream_path":"/chat","converter":"claude_messages_to_openai_chat"}]}}`, constant.ChannelTypeAdvancedCustom, common.ChannelStatusEnabled, false, false, false},
+		{"claude-converted-route", "default", "", `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/messages","upstream_path":"/chat","converter":"anthropic_messages_to_openai_chat_completions"}]}}`, constant.ChannelTypeAdvancedCustom, common.ChannelStatusEnabled, true, true, false},
+		{"claude-blocked-route", "default", passthrough, `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/messages","upstream_path":"/chat","converter":"anthropic_messages_to_openai_chat_completions"}]}}`, constant.ChannelTypeAdvancedCustom, common.ChannelStatusEnabled, false, false, false},
 		{"claude-malformed-setting", "default", "invalid-json", "", constant.ChannelTypeOpenAI, common.ChannelStatusEnabled, false, false, false},
 		{"gemini-2.5-flash", "default", "", "", constant.ChannelTypeVertexAi, common.ChannelStatusEnabled, false, false, true},
 		{"amazon.nova-pro-v1:0", "default", "", "", constant.ChannelTypeAws, common.ChannelStatusEnabled, false, false, true},
@@ -465,6 +465,7 @@ func testLinkLiveToolCatalogs(t *testing.T, db *gorm.DB, client *linkTestClient)
 		{"native-chat-h", "default", "", "", constant.ChannelTypeDeepSeek, common.ChannelStatusEnabled, true, false, true},
 		{"native-chat-i", "default", "", "", constant.ChannelTypeSiliconFlow, common.ChannelStatusEnabled, true, false, true},
 		{"native-chat-j", "default", "", `{"ollama_openai_chat":true}`, constant.ChannelTypeOllama, common.ChannelStatusEnabled, true, false, true},
+		{"claude-invalid-converter", "default", "", `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/messages","upstream_path":"/chat","converter":"claude_messages_to_openai_chat"}]}}`, constant.ChannelTypeAdvancedCustom, common.ChannelStatusEnabled, false, false, false},
 	}
 	var channelIDs []int
 	t.Cleanup(func() {
@@ -643,6 +644,224 @@ func testLinkWorkBuddyWorkflow(t *testing.T, db *gorm.DB, client, otherDevice, o
 	linkAction(t, client, hermesConn, "disconnect", nil)
 }
 
+// This is the released connection schema before the registry protocol binding.
+// An isolated table lets the same real-database test exercise upgrade and fresh
+// creation without altering other fixtures or relying on an empty database.
+type linkConnectionBeforeRegistry struct {
+	ID               string `gorm:"type:varchar(36);primaryKey"`
+	ScopeHash        string `gorm:"type:char(64);not null;uniqueIndex"`
+	UserID           int    `gorm:"not null;index"`
+	DeviceID         string `gorm:"type:varchar(36);not null;index"`
+	ToolFamily       string `gorm:"type:varchar(32);not null"`
+	ConfigScope      string `gorm:"type:varchar(128);not null"`
+	Status           string `gorm:"type:varchar(20);not null"`
+	Revision         int64  `gorm:"not null"`
+	ActiveTokenID    int
+	CandidateTokenID int
+	CreatedAt        int64
+	UpdatedAt        int64
+}
+
+func testLinkRegistryMigration(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	for _, upgrade := range []bool{false, true} {
+		name := "registry_migration_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+		t.Cleanup(func() { require.NoError(t, db.Migrator().DropTable(name)) })
+		before := linkConnectionBeforeRegistry{ID: uuid.NewString(), ScopeHash: strings.Repeat("a", 64), UserID: 15, DeviceID: uuid.NewString(), ToolFamily: "hermes", ConfigScope: "default", Status: "active", Revision: 7, ActiveTokenID: 31, CandidateTokenID: 32, CreatedAt: 1700000000, UpdatedAt: 1700000001}
+		if upgrade {
+			require.NoError(t, db.Table(name).AutoMigrate(&linkConnectionBeforeRegistry{}))
+			require.NoError(t, db.Table(name).Create(&before).Error)
+		}
+		for range 2 {
+			require.NoError(t, db.Table(name).AutoMigrate(&model.LinkConnection{}))
+		}
+		if !upgrade {
+			require.NoError(t, db.Table(name).Create(&before).Error)
+		}
+		var preserved linkConnectionBeforeRegistry
+		require.NoError(t, db.Table(name).First(&preserved, "id = ?", before.ID).Error)
+		assert.Equal(t, before, preserved, "all released connection fields survive both migrations")
+		var current model.LinkConnection
+		require.NoError(t, db.Table(name).First(&current, "id = ?", before.ID).Error)
+		assert.Empty(t, current.ToolProtocol, "old connections are not assigned an invented protocol by DDL")
+		require.True(t, db.Migrator().HasColumn(name, "tool_protocol"))
+		for _, field := range []string{"scope_hash", "user_id", "device_id"} {
+			assert.True(t, db.Migrator().HasIndex(name, "idx_"+name+"_"+field), "preserve %s index", field)
+		}
+		current.ID = uuid.NewString()
+		assert.Error(t, db.Table(name).Create(&current).Error, "scope uniqueness survives migration")
+		current.ID, current.ScopeHash = before.ID, strings.Repeat("b", 64)
+		assert.Error(t, db.Table(name).Create(&current).Error, "primary-key uniqueness survives migration")
+		require.NoError(t, db.Table(name).Where("id = ?", before.ID).Update("tool_protocol", "openai_chat_completions").Error)
+		for range 2 {
+			require.NoError(t, db.Table(name).AutoMigrate(&model.LinkConnection{}))
+		}
+		current = model.LinkConnection{}
+		require.NoError(t, db.Table(name).First(&current, "id = ?", before.ID).Error)
+		assert.Equal(t, "openai_chat_completions", current.ToolProtocol, "restart retains the pinned protocol")
+	}
+}
+
+func testLinkRegisteredResponsesCatalog(t *testing.T, db *gorm.DB, client *linkTestClient) {
+	t.Helper()
+	registry := filepath.Join(t.TempDir(), "responses-tools.json")
+	require.NoError(t, os.WriteFile(registry, []byte(`{"version":1,"tools":[{"id":"responses_agent","protocol":"openai_responses"}]}`), 0600))
+	t.Setenv("LINK_TOOL_REGISTRY_FILE", registry)
+	t.Setenv("LINK_MODEL_CATALOG_FILE", "")
+	priorPassThrough := model_setting.GetGlobalSettings().PassThroughRequestEnabled
+	t.Cleanup(func() { model_setting.GetGlobalSettings().PassThroughRequestEnabled = priorPassThrough })
+	model_setting.GetGlobalSettings().PassThroughRequestEnabled = false
+	passthrough := `{"pass_through_body_enabled":true}`
+	cases := []struct {
+		name, group, setting, settings string
+		channelType                    int
+		normal, globalPass             bool
+	}{
+		{"responses-chat-tagged", "default", "", "", constant.ChannelTypeOpenAI, true, true},
+		{"responses-anthropic", "default", "", "", constant.ChannelTypeAnthropic, true, false},
+		{"responses-gemini", "default", "", "", constant.ChannelTypeGemini, true, false},
+		{"responses-anthropic-raw", "default", passthrough, "", constant.ChannelTypeAnthropic, false, false},
+		{"responses-aws", "default", "", "", constant.ChannelTypeAws, false, false},
+		{"responses-silicon", "default", "", "", constant.ChannelTypeSiliconFlow, false, false},
+		{"responses-codex", "default", "", "", constant.ChannelTypeCodex, true, false},
+		{"responses-native-route", "default", passthrough, `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/responses","upstream_path":"/responses"}]}}`, constant.ChannelTypeAdvancedCustom, true, true},
+		{"responses-converted", "default", "", `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/responses","upstream_path":"/chat","converter":"openai_responses_to_openai_chat_completions"}]}}`, constant.ChannelTypeAdvancedCustom, true, false},
+		{"responses-first-route", "default", passthrough, `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/responses","upstream_path":"/chat","converter":"openai_responses_to_openai_chat_completions"},{"incoming_path":"/v1/responses","upstream_path":"/responses"}]}}`, constant.ChannelTypeAdvancedCustom, false, false},
+		{"responses-mixed", "default", "", "", constant.ChannelTypeOpenAI, false, false},
+		{"responses-mixed", "default", "", "", constant.ChannelTypeAws, false, false},
+		{"responses-isolated", "default", "", "", constant.ChannelTypeOpenAI, true, true},
+		{"responses-isolated", "vip", "", "", constant.ChannelTypeAws, true, true},
+		{"responses-unmatched-invalid", "default", "", "", constant.ChannelTypeOpenAI, true, true},
+		{"responses-unmatched-invalid", "default", "", `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/chat/completions","upstream_path":""}]}}`, constant.ChannelTypeAdvancedCustom, true, true},
+		{"responses-matched-invalid", "default", "", "", constant.ChannelTypeOpenAI, false, false},
+		{"responses-matched-invalid", "default", "", `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/responses","upstream_path":""}]}}`, constant.ChannelTypeAdvancedCustom, false, false},
+	}
+	var ids []int
+	t.Cleanup(func() {
+		require.NoError(t, db.Where("channel_id IN ?", ids).Delete(&model.Ability{}).Error)
+		require.NoError(t, db.Where("id IN ?", ids).Delete(&model.Channel{}).Error)
+	})
+	for _, tc := range cases {
+		channel := model.Channel{Type: tc.channelType, Status: common.ChannelStatusEnabled, Name: tc.name, Key: "unused", OtherSettings: tc.settings}
+		if tc.setting != "" {
+			channel.Setting = &tc.setting
+		}
+		require.NoError(t, db.Create(&channel).Error)
+		ids = append(ids, channel.Id)
+		require.NoError(t, db.Create(&model.Ability{Group: tc.group, Model: tc.name, ChannelId: channel.Id, Enabled: true}).Error)
+	}
+	for _, globalPass := range []bool{false, true} {
+		model_setting.GetGlobalSettings().PassThroughRequestEnabled = globalPass
+		catalog := client.request("GET", "/catalog?tool_family=responses_agent&group=default", nil, 200)
+		names := map[string]bool{}
+		for _, raw := range catalog.Data["models"].([]any) {
+			entry := raw.(map[string]any)
+			names[entry["id"].(string)] = true
+			assert.Equal(t, "openai_responses", entry["protocol"])
+		}
+		for _, tc := range cases {
+			want := tc.normal
+			if globalPass {
+				want = tc.globalPass
+			}
+			assert.Equal(t, want, names[tc.name], "%s global pass-through=%v", tc.name, globalPass)
+		}
+	}
+}
+
+func testLinkConfigurableTools(t *testing.T, db *gorm.DB, client *linkTestClient) {
+	t.Helper()
+	t.Setenv("LINK_MODEL_CATALOG_FILE", "")
+	registryPath := filepath.Join(t.TempDir(), "tools.json")
+	t.Setenv("LINK_TOOL_REGISTRY_FILE", registryPath)
+	definition := gin.H{"id": "registry_chat", "protocol": "openai_chat_completions", "verification_targets": []string{"registry-chat"}}
+	writeRegistry := func(entries ...gin.H) {
+		t.Helper()
+		if entries == nil {
+			entries = []gin.H{}
+		}
+		raw, err := common.Marshal(gin.H{"version": 1, "tools": entries})
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(registryPath+".next", raw, 0600))
+		require.NoError(t, os.Rename(registryPath+".next", registryPath))
+	}
+	writeRegistry(definition)
+	catalog := client.request("GET", "/catalog?tool_family=registry_chat&group=default", nil, 200)
+	client.request("GET", "/catalog?tool_family=unregistered&group=default", nil, 400)
+	client.request("GET", "/catalog?tool_family=registry_chat&group=not-authorized", nil, 403)
+	create := gin.H{"operation_id": uuid.NewString(), "tool_family": "registry_chat", "config_scope": "default", "group": "default", "models": []string{"verified-model"}, "default_model": "verified-model", "catalog_revision": catalog.Data["revision"]}
+	created := client.request("POST", "/connections", create, 200)
+	conn := linkConnectionFrom(t, created)
+	var persisted model.LinkConnection
+	require.NoError(t, db.First(&persisted, "id = ?", conn["id"]).Error)
+	assert.Equal(t, "openai_chat_completions", persisted.ToolProtocol)
+	writeRegistry(definition, gin.H{"id": "unrelated_agent", "protocol": "anthropic_messages"})
+	assert.Equal(t, catalog.Data["revision"], client.request("GET", "/catalog?tool_family=registry_chat&group=default", nil, 200).Data["revision"], "unrelated additions do not invalidate a displayed selection")
+	conn = linkConnectionFrom(t, linkAction(t, client, conn, "commit", nil))
+	tokenID := int(created.Data["token_id"].(float64))
+	// A metadata-only definition change invalidates selections, not existing keys.
+	definition["verification_targets"] = []string{"registry-chat", "registry-chat-alt"}
+	writeRegistry(definition)
+	changed := client.request("GET", "/catalog?tool_family=registry_chat&group=default", nil, 200)
+	assert.NotEqual(t, catalog.Data["revision"], changed.Data["revision"])
+	stale := gin.H{"operation_id": uuid.NewString(), "tool_family": "registry_chat", "config_scope": "stale", "group": "default", "models": []string{"verified-model"}, "default_model": "verified-model", "catalog_revision": catalog.Data["revision"]}
+	assert.Equal(t, "LINK_CATALOG_CHANGED", client.request("POST", "/connections", stale, 409).Code)
+	for _, mode := range []string{"disabled", "removed", "malformed", "protocol_changed"} {
+		t.Run(mode, func(t *testing.T) {
+			status := 400
+			switch mode {
+			case "disabled":
+				definition["enabled"] = false
+				writeRegistry(definition)
+				delete(definition, "enabled")
+			case "removed":
+				writeRegistry()
+			case "malformed":
+				require.NoError(t, os.WriteFile(registryPath, []byte("{"), 0600))
+				status = 503
+			case "protocol_changed":
+				definition["protocol"] = "anthropic_messages"
+				writeRegistry(definition)
+				definition["protocol"] = "openai_chat_completions"
+				status = 409
+			}
+			// Successful operation replay must not reauthorize or issue a replacement key.
+			replay := client.request("POST", "/connections", create, 200)
+			assert.Equal(t, created.Data["token_id"], replay.Data["token_id"])
+			client.request("GET", "/connections/"+conn["id"].(string), nil, 200)
+			client.request("GET", "/operations/"+create["operation_id"].(string), nil, 200)
+			for _, action := range []string{"resume", "update_models", "prepare_switch"} {
+				body := gin.H{"operation_id": uuid.NewString(), "action": action, "expected_revision": conn["revision"], "group": "vip", "models": []string{"verified-model"}, "default_model": "verified-model", "catalog_revision": changed.Data["revision"]}
+				client.request("POST", "/connections/"+conn["id"].(string)+"/actions", body, status)
+			}
+			var token model.Token
+			require.NoError(t, db.First(&token, tokenID).Error)
+			assert.Equal(t, common.TokenStatusEnabled, token.Status, "registry does not implicitly revoke an already issued inference key")
+			conn = linkConnectionFrom(t, linkAction(t, client, conn, "pause", nil))
+			writeRegistry(definition)
+			conn = linkConnectionFrom(t, linkAction(t, client, conn, "resume", nil))
+		})
+	}
+	// Candidate commit is admitted again; removal still allows abort and disconnect.
+	vip := client.request("GET", "/catalog?tool_family=registry_chat&group=vip", nil, 200)
+	conn = linkConnectionFrom(t, linkAction(t, client, conn, "prepare_switch", gin.H{"group": "vip", "models": []string{"verified-model"}, "default_model": "verified-model", "catalog_revision": vip.Data["revision"]}))
+	writeRegistry()
+	client.request("POST", "/connections/"+conn["id"].(string)+"/actions", gin.H{"operation_id": uuid.NewString(), "action": "commit", "expected_revision": conn["revision"]}, 400)
+	conn = linkConnectionFrom(t, linkAction(t, client, conn, "abort", nil))
+	linkAction(t, client, conn, "disconnect", nil)
+	// Only known released tool IDs can recover an empty protocol from old data.
+	writeRegistry(definition)
+	builtin := client.request("GET", "/catalog?tool_family=hermes&group=default", nil, 200)
+	old := client.request("POST", "/connections", gin.H{"operation_id": uuid.NewString(), "tool_family": "hermes", "config_scope": "registry-legacy", "group": "default", "models": []string{"verified-model"}, "default_model": "verified-model", "catalog_revision": builtin.Data["revision"]}, 200)
+	legacy := linkConnectionFrom(t, old)
+	require.NoError(t, db.Model(&model.LinkConnection{}).Where("id = ?", legacy["id"]).Update("tool_protocol", "").Error)
+	legacy = linkConnectionFrom(t, linkAction(t, client, legacy, "commit", nil))
+	persisted = model.LinkConnection{}
+	require.NoError(t, db.First(&persisted, "id = ?", legacy["id"]).Error)
+	assert.Equal(t, "openai_chat_completions", persisted.ToolProtocol)
+	linkAction(t, client, legacy, "disconnect", nil)
+}
+
 func TestLinkAPIWorkflowAndDatabaseCompatibility(t *testing.T) {
 	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
 		t.Run(dialect, func(t *testing.T) {
@@ -687,6 +906,8 @@ func TestLinkAPIWorkflowAndDatabaseCompatibility(t *testing.T) {
 			})
 			require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(`{"default":"Default","vip":"VIP"}`))
 			t.Setenv("LINK_PUBLIC_URL", "http://127.0.0.1:3000")
+			t.Setenv("LINK_TOOL_REGISTRY_FILE", "")
+			t.Run("registry_connection_migration", func(t *testing.T) { testLinkRegistryMigration(t, db) })
 			catalog := filepath.Join(t.TempDir(), "catalog.json")
 			require.NoError(t, os.WriteFile(catalog, []byte(`{"models":[{"id":"verified-model","protocol":"openai_responses","tool_families":["codex"],"groups":["default","vip"],"price_text":"untrusted static quote","metadata":{"codex":{"slug":"verified-model"}}},{"id":"verified-second","protocol":"openai_responses","tool_families":["codex"],"groups":["default","vip"],"metadata":{"codex":{"slug":"verified-second"}}}]}`), 0600))
 			t.Setenv("LINK_MODEL_CATALOG_FILE", catalog)
@@ -848,6 +1069,8 @@ func TestLinkAPIWorkflowAndDatabaseCompatibility(t *testing.T) {
 			conn = linkConnectionFrom(t, committed)
 			testLinkToolVerification(t, db, client, secondDevice, otherClient, conn, user.Id, firstID, "codex-cli", "openai_responses", "/v1/responses")
 			t.Run("live_tool_catalogs", func(t *testing.T) { testLinkLiveToolCatalogs(t, db, client) })
+			t.Run("configurable_tools", func(t *testing.T) { testLinkConfigurableTools(t, db, client) })
+			t.Run("registered_responses_catalog", func(t *testing.T) { testLinkRegisteredResponsesCatalog(t, db, client) })
 			t.Run("hermes", func(t *testing.T) {
 				testLinkHermesWorkflow(t, db, client, secondDevice, otherClient, user.Id)
 			})

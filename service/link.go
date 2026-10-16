@@ -205,25 +205,31 @@ type LinkCatalog struct {
 	DefaultModel string             `json:"default_model"`
 }
 
-func ValidLinkTool(tool string) bool {
-	return tool == "codex" || tool == "claude_code" || tool == "claude_desktop" || tool == "hermes" || tool == "workbuddy"
-}
 func GetLinkCatalog(userID int, tool, group string) (*LinkCatalog, error) {
 	user, err := model.GetSelfUserById(userID)
 	if err != nil {
 		return nil, err
 	}
-	return linkCatalogForUser(model.DB, user, tool, group)
+	registry, err := common.LoadLinkToolRegistry()
+	if err != nil {
+		return nil, model.ErrLinkToolRegistry
+	}
+	definition, enabled := registry.Tool(tool)
+	if !enabled {
+		return nil, model.LinkFailure(400, "LINK_INVALID_REQUEST", "Select a supported tool and explicit price group")
+	}
+	return linkCatalogForUser(model.DB, user, definition, group)
 }
-func linkCatalogForUser(tx *gorm.DB, user *model.User, tool, group string) (*LinkCatalog, error) {
-	if !ValidLinkTool(tool) || group == "" || group == "auto" || len(group) > 64 {
+func linkCatalogForUser(tx *gorm.DB, user *model.User, definition common.LinkToolDefinition, group string) (*LinkCatalog, error) {
+	tool := definition.ID
+	if group == "" || group == "auto" || len(group) > 64 {
 		return nil, model.LinkFailure(400, "LINK_INVALID_REQUEST", "Select a supported tool and explicit price group")
 	}
 	if !IsUserSelectableGroup(user.Group, group) {
 		return nil, model.LinkFailure(403, "LINK_FORBIDDEN", "Price group is not available to this account")
 	}
-	if tool != "codex" {
-		return linkLiveCatalog(tx, user, tool, group)
+	if definition.Profile != common.LinkProfileCodex {
+		return linkLiveCatalog(tx, user, definition, group)
 	}
 	file, err := os.Open(os.Getenv("LINK_MODEL_CATALOG_FILE"))
 	if err != nil {
@@ -246,13 +252,7 @@ func linkCatalogForUser(tx *gorm.DB, user *model.User, tool, group string) (*Lin
 		return nil, err
 	}
 	result := &LinkCatalog{ToolFamily: tool, Group: group, Models: []LinkCatalogEntry{}}
-	protocol := "anthropic_messages"
-	switch tool {
-	case "codex":
-		protocol = "openai_responses"
-	case "hermes", "workbuddy":
-		protocol = "openai_chat_completions"
-	}
+	protocol := definition.Protocol
 	seen := map[string]bool{}
 	for _, entry := range configured.Models {
 		if !slices.Contains(entry.ToolFamilies, tool) || !slices.Contains(entry.Groups, group) {
@@ -287,7 +287,8 @@ func linkCatalogForUser(tx *gorm.DB, user *model.User, tool, group string) (*Lin
 		Raw         string
 		Tool, Group string
 		Models      []LinkCatalogEntry
-	}{string(raw), tool, group, result.Models})
+		Definition  common.LinkToolDefinition
+	}{string(raw), tool, group, result.Models, definition})
 	sum := sha256.Sum256(material)
 	result.Revision = hex.EncodeToString(sum[:])
 	return result, nil
@@ -313,11 +314,14 @@ func linkClaudeDesktopModel(name string) bool {
 
 // Model availability follows current routes. Optional compatibility metadata can
 // enrich a model but must not hide a newly enabled route behind a second allowlist.
-func linkLiveCatalog(tx *gorm.DB, user *model.User, tool, group string) (*LinkCatalog, error) {
-	messages := tool == "claude_code" || tool == "claude_desktop"
-	protocol, requestPath := "openai_chat_completions", "/v1/chat/completions"
-	if messages {
-		protocol, requestPath = "anthropic_messages", "/v1/messages"
+func linkLiveCatalog(tx *gorm.DB, user *model.User, definition common.LinkToolDefinition, group string) (*LinkCatalog, error) {
+	tool, protocol := definition.ID, definition.Protocol
+	requestPath := "/v1/chat/completions"
+	switch protocol {
+	case common.LinkProtocolMessages:
+		requestPath = "/v1/messages"
+	case common.LinkProtocolResponses:
+		requestPath = "/v1/responses"
 	}
 	var abilities []model.Ability
 	if err := tx.Where(&model.Ability{Group: group, Enabled: true}).Find(&abilities).Error; err != nil {
@@ -373,7 +377,7 @@ func linkLiveCatalog(tx *gorm.DB, user *model.User, tool, group string) (*LinkCa
 				advanced = common.GetAdvancedCustomPreset(channel.Type)
 			}
 		}
-		if tool == "claude_desktop" && !linkClaudeDesktopModel(ability.Model) {
+		if definition.Profile == common.LinkProfileClaudeDesktop && !linkClaudeDesktopModel(ability.Model) {
 			continue
 		}
 		supported := slices.Contains(endpoints, constant.EndpointTypeOpenAI)
@@ -394,8 +398,29 @@ func linkLiveCatalog(tx *gorm.DB, user *model.User, tool, group string) (*LinkCa
 			if !matched {
 				continue
 			}
+			if advanced.Validate() != nil {
+				blocked[ability.Model] = true
+				continue
+			}
 			supported = !(passThrough || route.PassThroughBodyEnabled) || route.SupportsPassThroughBody()
-		} else if messages {
+		} else if protocol == common.LinkProtocolResponses {
+			// Endpoint lists describe preferred presentation, not the adaptor's
+			// request/response conversion contract. These implementations handle
+			// native responses bodies and responses streams without conversion.
+			supported = known && slices.Contains([]int{
+				constant.APITypeOpenAI, constant.APITypeOpenRouter, constant.APITypeXinference,
+				constant.APITypeNewAPI, constant.APITypeSub2API, constant.APITypeAli,
+				constant.APITypeZhipuV4, constant.APITypeOllama, constant.APITypePerplexity,
+				constant.APITypeDeepSeek, constant.APITypeVolcEngine, constant.APITypeXai,
+				constant.APITypeCloudflare,
+			}, apiType)
+			if !passThrough && known && slices.Contains([]int{constant.APITypeAnthropic, constant.APITypeGemini, constant.APITypeCodex}, apiType) {
+				// Anthropic/Gemini convert both directions. The Codex channel
+				// requires normalized responses fields even though its body shape
+				// is otherwise native; raw passthrough skips those requirements.
+				supported = true
+			}
+		} else if protocol == common.LinkProtocolMessages {
 			// These adaptors route Claude bodies to a native messages endpoint;
 			// they do not require chat/envelope conversion even with passthrough.
 			supported = known && slices.Contains([]int{
@@ -485,7 +510,7 @@ func linkLiveCatalog(tx *gorm.DB, user *model.User, tool, group string) (*LinkCa
 				if entry.Protocol != protocol {
 					continue
 				}
-				if tool != "workbuddy" {
+				if definition.Profile != common.LinkProfileWorkBuddy {
 					metadata[entry.ID] = entry.Metadata
 					continue
 				}
@@ -519,7 +544,7 @@ func linkLiveCatalog(tx *gorm.DB, user *model.User, tool, group string) (*LinkCa
 	for _, name := range names {
 		entry := LinkCatalogEntry{ID: name, Label: name, Protocol: protocol, Metadata: map[string]any{}, PriceText: linkModelPriceText(user.Group, group, name)}
 		if capabilities := metadata[name]; capabilities != nil {
-			if tool == "workbuddy" {
+			if definition.Profile == common.LinkProfileWorkBuddy {
 				entry.Metadata["workbuddy"] = capabilities
 			} else {
 				entry.Metadata = capabilities
@@ -527,7 +552,10 @@ func linkLiveCatalog(tx *gorm.DB, user *model.User, tool, group string) (*LinkCa
 		}
 		result.Models = append(result.Models, entry)
 	}
-	material, _ := common.Marshal(result)
+	material, _ := common.Marshal(struct {
+		Catalog    *LinkCatalog
+		Definition common.LinkToolDefinition
+	}{result, definition})
 	sum := sha256.Sum256(material)
 	result.Revision = hex.EncodeToString(sum[:])
 	return result, nil
@@ -612,7 +640,7 @@ func ApplyLinkAction(session *model.LinkSession, id string, r model.LinkActionRe
 		if r.ConfigScope == "" {
 			r.ConfigScope = "default"
 		}
-		if !ValidLinkTool(r.ToolFamily) || !linkScopePattern.MatchString(r.ConfigScope) {
+		if !common.ValidLinkToolID(r.ToolFamily) || !linkScopePattern.MatchString(r.ConfigScope) {
 			return nil, model.LinkFailure(400, "LINK_INVALID_REQUEST", "Invalid tool or configuration scope")
 		}
 	}
@@ -625,8 +653,19 @@ func ApplyLinkAction(session *model.LinkSession, id string, r model.LinkActionRe
 	if result, err := model.RetryLinkOperation(session, id, r); result != nil || err != nil {
 		return result, err
 	}
+	// Completed idempotent results and cleanup actions remain available even
+	// after a tool is disabled or the administrator's registry file is invalid.
+	admit := slices.Contains([]string{"create", "prepare_switch", "update_models", "commit", "resume"}, r.Action)
+	var registry *common.LinkToolRegistry
+	if admit {
+		var err error
+		registry, err = common.LoadLinkToolRegistry()
+		if err != nil {
+			return nil, model.ErrLinkToolRegistry
+		}
+	}
 	validate := func(tx *gorm.DB, user *model.User, conn *model.LinkConnection) error {
-		if r.Action != "create" && r.Action != "prepare_switch" && r.Action != "update_models" && r.Action != "commit" && r.Action != "resume" {
+		if !admit {
 			return nil
 		}
 		tool, group := r.ToolFamily, r.Group
@@ -651,7 +690,18 @@ func ApplyLinkAction(session *model.LinkSession, id string, r model.LinkActionRe
 				}
 			}
 		}
-		catalog, err := linkCatalogForUser(tx, user, tool, group)
+		definition, enabled := registry.Tool(tool)
+		if !enabled {
+			return model.LinkFailure(400, "LINK_INVALID_REQUEST", "Select a supported tool and explicit price group")
+		}
+		if conn.Revision == 0 && r.Action == "create" {
+			conn.ToolProtocol = definition.Protocol
+		} else if !conn.MatchesLinkToolProtocol(definition) {
+			return model.ErrLinkState
+		} else if conn.ToolProtocol == "" {
+			conn.ToolProtocol = definition.Protocol
+		}
+		catalog, err := linkCatalogForUser(tx, user, definition, group)
 		if err != nil {
 			return err
 		}
