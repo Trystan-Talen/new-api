@@ -21,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
@@ -415,6 +416,113 @@ func testLinkWorkBuddyLiveCatalog(t *testing.T, db *gorm.DB, client *linkTestCli
 	}
 }
 
+func testLinkLiveToolCatalogs(t *testing.T, db *gorm.DB, client *linkTestClient) {
+	t.Helper()
+	t.Setenv("LINK_MODEL_CATALOG_FILE", "")
+	priorPassThrough := model_setting.GetGlobalSettings().PassThroughRequestEnabled
+	model_setting.GetGlobalSettings().PassThroughRequestEnabled = false
+	t.Cleanup(func() { model_setting.GetGlobalSettings().PassThroughRequestEnabled = priorPassThrough })
+	passthrough := `{"pass_through_body_enabled":true}`
+	cases := []struct {
+		name, group, setting, other string
+		channelType, status         int
+		code, desktop, hermes       bool
+	}{
+		{"claude-opus-4-8", "default", "", "", constant.ChannelTypeOpenAI, common.ChannelStatusEnabled, true, true, true},
+		{"new-chat-model", "default", "", "", constant.ChannelTypeOpenAI, common.ChannelStatusEnabled, true, false, true},
+		{"claude-gpt-mixed", "default", "", "", constant.ChannelTypeOpenAI, common.ChannelStatusEnabled, true, false, true},
+		{"opus", "default", "", "", constant.ChannelTypeAnthropic, common.ChannelStatusEnabled, true, false, true},
+		{"claude-disabled", "default", "", "", constant.ChannelTypeOpenAI, common.ChannelStatusManuallyDisabled, false, false, false},
+		{"claude-other-group", "vip", "", "", constant.ChannelTypeOpenAI, common.ChannelStatusEnabled, false, false, false},
+		{"claude-xai", "default", "", "", constant.ChannelTypeXai, common.ChannelStatusEnabled, false, false, true},
+		{"claude-passthrough", "default", passthrough, "", constant.ChannelTypeOpenAI, common.ChannelStatusEnabled, false, false, true},
+		{"claude-aws-passthrough", "default", passthrough, "", constant.ChannelTypeAws, common.ChannelStatusEnabled, false, false, false},
+		{"claude-mixed-routes", "default", "", "", constant.ChannelTypeOpenAI, common.ChannelStatusEnabled, false, false, true},
+		{"claude-mixed-routes", "default", "", "", constant.ChannelTypeXai, common.ChannelStatusEnabled, false, false, true},
+		{"claude-group-isolated", "default", "", "", constant.ChannelTypeOpenAI, common.ChannelStatusEnabled, true, true, true},
+		{"claude-chat-only", "default", "", `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/chat/completions","upstream_path":"/chat"}]}}`, constant.ChannelTypeAdvancedCustom, common.ChannelStatusEnabled, false, false, true},
+		{"claude-route", "default", "", `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/messages","upstream_path":"/messages"}]}}`, constant.ChannelTypeAdvancedCustom, common.ChannelStatusEnabled, true, true, false},
+		{"claude-converted-route", "default", "", `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/messages","upstream_path":"/chat","converter":"claude_messages_to_openai_chat"}]}}`, constant.ChannelTypeAdvancedCustom, common.ChannelStatusEnabled, true, true, false},
+		{"claude-blocked-route", "default", passthrough, `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/messages","upstream_path":"/chat","converter":"claude_messages_to_openai_chat"}]}}`, constant.ChannelTypeAdvancedCustom, common.ChannelStatusEnabled, false, false, false},
+		{"claude-malformed-setting", "default", "invalid-json", "", constant.ChannelTypeOpenAI, common.ChannelStatusEnabled, false, false, false},
+		{"gemini-2.5-flash", "default", "", "", constant.ChannelTypeVertexAi, common.ChannelStatusEnabled, false, false, true},
+		{"amazon.nova-pro-v1:0", "default", "", "", constant.ChannelTypeAws, common.ChannelStatusEnabled, false, false, true},
+		{"sonnet[1m]", "default", "", "", constant.ChannelTypeAnthropic, common.ChannelStatusEnabled, true, false, true},
+		{"claude-sonnet-4[1M]", "default", "", "", constant.ChannelTypeAnthropic, common.ChannelStatusEnabled, true, false, true},
+		{" claude-sonnet-4 ", "default", "", "", constant.ChannelTypeAnthropic, common.ChannelStatusEnabled, true, false, true},
+	}
+	var channelIDs []int
+	t.Cleanup(func() {
+		require.NoError(t, db.Where("channel_id IN ?", channelIDs).Delete(&model.Ability{}).Error)
+		require.NoError(t, db.Where("id IN ?", channelIDs).Delete(&model.Channel{}).Error)
+	})
+	for _, tc := range cases {
+		channel := model.Channel{Type: tc.channelType, Status: tc.status, Name: tc.name, Key: "unused", Setting: &tc.setting, OtherSettings: tc.other}
+		require.NoError(t, db.Create(&channel).Error)
+		channelIDs = append(channelIDs, channel.Id)
+		require.NoError(t, db.Create(&model.Ability{Group: tc.group, Model: tc.name, ChannelId: channel.Id, Enabled: true}).Error)
+	}
+	// An incompatible route in another group cannot hide this group's model.
+	require.NoError(t, db.Create(&model.Ability{Group: "vip", Model: "claude-group-isolated", ChannelId: channelIDs[6], Enabled: true}).Error)
+	// An advanced channel without this incoming path is not a selectable competitor.
+	require.NoError(t, db.Create(&model.Ability{Group: "default", Model: "claude-opus-4-8", ChannelId: channelIDs[12], Enabled: true}).Error)
+	for _, tool := range []string{"hermes", "claude_code", "claude_desktop"} {
+		t.Run(tool, func(t *testing.T) {
+			catalog := client.request("GET", "/catalog?tool_family="+tool+"&group=default", nil, 200)
+			names := make(map[string]bool)
+			for _, item := range catalog.Data["models"].([]any) {
+				entry := item.(map[string]any)
+				names[entry["id"].(string)] = true
+				assert.Empty(t, entry["metadata"], "a live route needs no manually maintained compatibility entry")
+				protocol := "anthropic_messages"
+				if tool == "hermes" {
+					protocol = "openai_chat_completions"
+				}
+				assert.Equal(t, protocol, entry["protocol"])
+			}
+			for _, tc := range cases {
+				want := tc.code
+				if tool == "claude_desktop" {
+					want = tc.desktop
+				}
+				if tool == "hermes" {
+					want = tc.hermes
+				}
+				assert.Equal(t, want, names[tc.name], "%s: %s", tool, tc.name)
+			}
+			path := filepath.Join(t.TempDir(), "optional.json")
+			t.Setenv("LINK_MODEL_CATALOG_FILE", path)
+			for _, content := range []string{"invalid-json", `{"models":[]}`} {
+				require.NoError(t, os.WriteFile(path, []byte(content), 0600))
+				assert.Equal(t, catalog.Data["revision"], client.request("GET", "/catalog?tool_family="+tool+"&group=default", nil, 200).Data["revision"])
+			}
+			created := client.request("POST", "/connections", gin.H{"operation_id": uuid.NewString(), "tool_family": tool, "config_scope": "live-catalog", "group": "default", "models": []string{"claude-opus-4-8"}, "default_model": "claude-opus-4-8", "catalog_revision": catalog.Data["revision"]}, 200)
+			linkAction(t, client, linkConnectionFrom(t, created), "abort", nil)
+		})
+	}
+	var untouched model.Channel
+	require.NoError(t, db.First(&untouched, channelIDs[16]).Error)
+	require.NotNil(t, untouched.Setting)
+	assert.Equal(t, "invalid-json", *untouched.Setting, "catalog reads must not repair or overwrite channel settings")
+	beforeRemoval := client.request("GET", "/catalog?tool_family=claude_desktop&group=default", nil, 200)
+	created := client.request("POST", "/connections", gin.H{"operation_id": uuid.NewString(), "tool_family": "claude_desktop", "config_scope": "removed-route", "group": "default", "models": []string{"claude-opus-4-8"}, "default_model": "claude-opus-4-8", "catalog_revision": beforeRemoval.Data["revision"]}, 200)
+	pending := linkConnectionFrom(t, created)
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channelIDs[0]).Update("status", common.ChannelStatusManuallyDisabled).Error)
+	assert.NotEqual(t, beforeRemoval.Data["revision"], client.request("GET", "/catalog?tool_family=claude_desktop&group=default", nil, 200).Data["revision"])
+	client.request("POST", "/connections/"+pending["id"].(string)+"/actions", gin.H{"operation_id": uuid.NewString(), "action": "commit", "expected_revision": pending["revision"]}, 400)
+	linkAction(t, client, pending, "abort", nil)
+	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channelIDs[0]).Update("status", common.ChannelStatusEnabled).Error)
+	model_setting.GetGlobalSettings().PassThroughRequestEnabled = true
+	for _, tool := range []string{"claude_code", "claude_desktop"} {
+		catalog := client.request("GET", "/catalog?tool_family="+tool+"&group=default", nil, 200)
+		for _, item := range catalog.Data["models"].([]any) {
+			id := item.(map[string]any)["id"]
+			assert.NotEqual(t, "claude-opus-4-8", id)
+			assert.NotEqual(t, "claude-converted-route", id)
+		}
+	}
+}
+
 func testLinkWorkBuddyWorkflow(t *testing.T, db *gorm.DB, client, otherDevice, otherUser *linkTestClient) {
 	t.Helper()
 	t.Run("live_routes", func(t *testing.T) { testLinkWorkBuddyLiveCatalog(t, db, client) })
@@ -438,7 +546,7 @@ func testLinkWorkBuddyWorkflow(t *testing.T, db *gorm.DB, client, otherDevice, o
 	}
 	assert.Equal(t, map[string]any{"workbuddy": map[string]any{"supportsToolCall": true, "supportsImages": false, "supportsReasoning": false, "maxInputTokens": float64(8192)}}, models[1].(map[string]any)["metadata"], "verified capability metadata must reach the adapter unchanged")
 	hermesCatalog := client.request("GET", "/catalog?tool_family=hermes&group=default", nil, 200)
-	assert.Len(t, hermesCatalog.Data["models"], 1, "shared protocol does not imply shared tool compatibility")
+	assert.Len(t, hermesCatalog.Data["models"], 2, "Hermes uses live chat routes independently of optional compatibility metadata")
 	assert.NotEqual(t, catalog.Data["revision"], hermesCatalog.Data["revision"])
 	entries[0]["protocol"] = "openai_responses"
 	invalid, err := common.Marshal(gin.H{"models": entries})
@@ -707,6 +815,7 @@ func TestLinkAPIWorkflowAndDatabaseCompatibility(t *testing.T) {
 			committed := linkAction(t, client, conn, "commit", nil)
 			conn = linkConnectionFrom(t, committed)
 			testLinkToolVerification(t, db, client, secondDevice, otherClient, conn, user.Id, firstID, "codex-cli", "openai_responses", "/v1/responses")
+			t.Run("live_tool_catalogs", func(t *testing.T) { testLinkLiveToolCatalogs(t, db, client) })
 			t.Run("hermes", func(t *testing.T) {
 				testLinkHermesWorkflow(t, db, client, secondDevice, otherClient, user.Id)
 			})

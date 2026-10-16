@@ -190,18 +190,18 @@ func testLinkHermesWorkflow(t *testing.T, db *gorm.DB, client, otherDevice, othe
 	require.NoError(t, os.WriteFile(catalogPath, raw, 0600))
 	t.Setenv("LINK_MODEL_CATALOG_FILE", catalogPath)
 	catalog := client.request("GET", "/catalog?tool_family=hermes&group=default", nil, 200)
-	assert.Equal(t, "verified-second", catalog.Data["default_model"], "platform order determines the initial model")
+	assert.Equal(t, "verified-model", catalog.Data["default_model"], "live model order determines the initial model")
 	models := catalog.Data["models"].([]any)
 	require.Len(t, models, 2)
 	for _, item := range models {
 		assert.Equal(t, "openai_chat_completions", item.(map[string]any)["protocol"])
 	}
-	// A tool-specific protocol error fails closed instead of being accepted by name.
+	// Invalid optional metadata must not hide a live, protocol-compatible route.
 	entries[0]["protocol"] = "openai_responses"
 	invalid, err := common.Marshal(gin.H{"models": entries})
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(catalogPath, invalid, 0600))
-	client.request("GET", "/catalog?tool_family=hermes&group=default", nil, 503)
+	assert.Equal(t, catalog.Data["revision"], client.request("GET", "/catalog?tool_family=hermes&group=default", nil, 200).Data["revision"])
 	require.NoError(t, os.WriteFile(catalogPath, raw, 0600))
 	create := gin.H{"operation_id": uuid.NewString(), "tool_family": "hermes", "config_scope": "default", "group": "default", "models": []string{"verified-model", "verified-second"}, "default_model": "verified-model", "catalog_revision": catalog.Data["revision"]}
 	created := client.request("POST", "/connections", create, 200)
