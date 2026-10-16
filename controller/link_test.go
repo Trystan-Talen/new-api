@@ -426,7 +426,7 @@ func testLinkLiveToolCatalogs(t *testing.T, db *gorm.DB, client *linkTestClient)
 	cases := []struct {
 		name, group, setting, other string
 		channelType, status         int
-		code, desktop, hermes       bool
+		code, desktop, chat         bool
 	}{
 		{"claude-opus-4-8", "default", "", "", constant.ChannelTypeOpenAI, common.ChannelStatusEnabled, true, true, true},
 		{"new-chat-model", "default", "", "", constant.ChannelTypeOpenAI, common.ChannelStatusEnabled, true, false, true},
@@ -450,6 +450,21 @@ func testLinkLiveToolCatalogs(t *testing.T, db *gorm.DB, client *linkTestClient)
 		{"sonnet[1m]", "default", "", "", constant.ChannelTypeAnthropic, common.ChannelStatusEnabled, true, false, true},
 		{"claude-sonnet-4[1M]", "default", "", "", constant.ChannelTypeAnthropic, common.ChannelStatusEnabled, true, false, true},
 		{" claude-sonnet-4 ", "default", "", "", constant.ChannelTypeAnthropic, common.ChannelStatusEnabled, true, false, true},
+		{"claude-chat-mixed", "default", "", "", constant.ChannelTypeOpenAI, common.ChannelStatusEnabled, true, true, false},
+		{"claude-chat-mixed", "default", passthrough, "", constant.ChannelTypeAnthropic, common.ChannelStatusEnabled, true, true, false},
+		{"claude-native-passthrough", "default", passthrough, "", constant.ChannelTypeAnthropic, common.ChannelStatusEnabled, true, true, false},
+		{"chat-converted", "default", "", `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/chat/completions","upstream_path":"/messages","converter":"openai_chat_completions_to_anthropic_messages"}]}}`, constant.ChannelTypeAdvancedCustom, common.ChannelStatusEnabled, false, false, true},
+		{"chat-converted-passthrough", "default", passthrough, `{"advanced_custom":{"advanced_routes":[{"incoming_path":"/v1/chat/completions","upstream_path":"/messages","converter":"openai_chat_completions_to_anthropic_messages"}]}}`, constant.ChannelTypeAdvancedCustom, common.ChannelStatusEnabled, false, false, false},
+		{"claude-native-a", "default", passthrough, "", constant.ChannelTypeDeepSeek, common.ChannelStatusEnabled, true, true, true},
+		{"claude-native-b", "default", passthrough, "", constant.ChannelTypeMoonshot, common.ChannelStatusEnabled, true, true, true},
+		{"native-chat-c", "default", passthrough, "", constant.ChannelTypeSiliconFlow, common.ChannelStatusEnabled, false, false, true},
+		{"claude-native-d", "default", passthrough, "", constant.ChannelTypeMiniMax, common.ChannelStatusEnabled, true, true, true},
+		{"claude-native-e", "default", passthrough, "", constant.ChannelTypeZhipu_v4, common.ChannelStatusEnabled, true, true, true},
+		{"claude-native-f", "default", passthrough, "", constant.ChannelTypeOllama, common.ChannelStatusEnabled, true, true, false},
+		{"claude-native-g", "default", passthrough, `{"ollama_openai_chat":true}`, constant.ChannelTypeOllama, common.ChannelStatusEnabled, true, true, true},
+		{"native-chat-h", "default", "", "", constant.ChannelTypeDeepSeek, common.ChannelStatusEnabled, true, false, true},
+		{"native-chat-i", "default", "", "", constant.ChannelTypeSiliconFlow, common.ChannelStatusEnabled, true, false, true},
+		{"native-chat-j", "default", "", `{"ollama_openai_chat":true}`, constant.ChannelTypeOllama, common.ChannelStatusEnabled, true, false, true},
 	}
 	var channelIDs []int
 	t.Cleanup(func() {
@@ -466,7 +481,7 @@ func testLinkLiveToolCatalogs(t *testing.T, db *gorm.DB, client *linkTestClient)
 	require.NoError(t, db.Create(&model.Ability{Group: "vip", Model: "claude-group-isolated", ChannelId: channelIDs[6], Enabled: true}).Error)
 	// An advanced channel without this incoming path is not a selectable competitor.
 	require.NoError(t, db.Create(&model.Ability{Group: "default", Model: "claude-opus-4-8", ChannelId: channelIDs[12], Enabled: true}).Error)
-	for _, tool := range []string{"hermes", "claude_code", "claude_desktop"} {
+	for _, tool := range []string{"hermes", "workbuddy", "claude_code", "claude_desktop"} {
 		t.Run(tool, func(t *testing.T) {
 			catalog := client.request("GET", "/catalog?tool_family="+tool+"&group=default", nil, 200)
 			names := make(map[string]bool)
@@ -475,7 +490,7 @@ func testLinkLiveToolCatalogs(t *testing.T, db *gorm.DB, client *linkTestClient)
 				names[entry["id"].(string)] = true
 				assert.Empty(t, entry["metadata"], "a live route needs no manually maintained compatibility entry")
 				protocol := "anthropic_messages"
-				if tool == "hermes" {
+				if tool == "hermes" || tool == "workbuddy" {
 					protocol = "openai_chat_completions"
 				}
 				assert.Equal(t, protocol, entry["protocol"])
@@ -485,8 +500,8 @@ func testLinkLiveToolCatalogs(t *testing.T, db *gorm.DB, client *linkTestClient)
 				if tool == "claude_desktop" {
 					want = tc.desktop
 				}
-				if tool == "hermes" {
-					want = tc.hermes
+				if tool == "hermes" || tool == "workbuddy" {
+					want = tc.chat
 				}
 				assert.Equal(t, want, names[tc.name], "%s: %s", tool, tc.name)
 			}
@@ -513,12 +528,29 @@ func testLinkLiveToolCatalogs(t *testing.T, db *gorm.DB, client *linkTestClient)
 	linkAction(t, client, pending, "abort", nil)
 	require.NoError(t, db.Model(&model.Channel{}).Where("id = ?", channelIDs[0]).Update("status", common.ChannelStatusEnabled).Error)
 	model_setting.GetGlobalSettings().PassThroughRequestEnabled = true
-	for _, tool := range []string{"claude_code", "claude_desktop"} {
+	for _, tool := range []string{"claude_code", "claude_desktop", "hermes", "workbuddy"} {
 		catalog := client.request("GET", "/catalog?tool_family="+tool+"&group=default", nil, 200)
+		var names []string
 		for _, item := range catalog.Data["models"].([]any) {
-			id := item.(map[string]any)["id"]
-			assert.NotEqual(t, "claude-opus-4-8", id)
-			assert.NotEqual(t, "claude-converted-route", id)
+			names = append(names, item.(map[string]any)["id"].(string))
+		}
+		if tool == "hermes" || tool == "workbuddy" {
+			assert.Contains(t, names, "claude-opus-4-8", "native chat routes remain usable with global passthrough")
+			assert.NotContains(t, names, "claude-native-passthrough", "chat requests still require conversion for an Anthropic channel")
+			assert.NotContains(t, names, "claude-chat-mixed", "one compatible route cannot hide a selectable incompatible route")
+			assert.NotContains(t, names, "chat-converted", "global passthrough cannot skip a required advanced route conversion")
+			assert.Contains(t, names, "native-chat-h", "DeepSeek has a native chat request body")
+			assert.Contains(t, names, "native-chat-i", "SiliconFlow has a native chat request body")
+			assert.Contains(t, names, "native-chat-j", "Ollama explicitly configured for OpenAI chat needs no envelope conversion")
+			assert.NotContains(t, names, "claude-native-f", "default Ollama chat still requires its native envelope")
+		} else {
+			assert.NotContains(t, names, "claude-opus-4-8")
+			assert.NotContains(t, names, "claude-converted-route")
+			assert.Contains(t, names, "claude-native-a", "native messages endpoints remain usable with passthrough")
+			assert.Contains(t, names, "claude-native-b")
+			assert.Contains(t, names, "claude-native-d")
+			assert.Contains(t, names, "claude-native-e")
+			assert.Contains(t, names, "claude-native-f")
 		}
 	}
 }

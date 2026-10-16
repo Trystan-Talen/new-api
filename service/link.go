@@ -377,71 +377,86 @@ func linkLiveCatalog(tx *gorm.DB, user *model.User, tool, group string) (*LinkCa
 			continue
 		}
 		supported := slices.Contains(endpoints, constant.EndpointTypeOpenAI)
-		if tool != "workbuddy" {
-			var setting dto.ChannelSettings
-			if channel.Setting != nil && *channel.Setting != "" && common.UnmarshalJsonStr(*channel.Setting, &setting) != nil {
-				blocked[ability.Model] = true
+		var setting dto.ChannelSettings
+		if channel.Setting != nil && *channel.Setting != "" && common.UnmarshalJsonStr(*channel.Setting, &setting) != nil {
+			blocked[ability.Model] = true
+			continue
+		}
+		passThrough := model_setting.GetGlobalSettings().PassThroughRequestEnabled || setting.PassThroughBodyEnabled
+		apiType, known := common.ChannelType2APIType(channel.Type)
+		if !known && (channel.Type == constant.ChannelTypeAzure || channel.Type == constant.ChannelTypeCustom) {
+			known = true
+		}
+		if advanced != nil {
+			// The router excludes advanced routes with no matching incoming path.
+			// Check the first matching route, just as the actual adaptor does.
+			route, matched := advanced.MatchPathForModel(requestPath, ability.Model)
+			if !matched {
 				continue
 			}
-			passThrough := model_setting.GetGlobalSettings().PassThroughRequestEnabled || setting.PassThroughBodyEnabled
-			apiType, known := common.ChannelType2APIType(channel.Type)
-			if !known && (channel.Type == constant.ChannelTypeAzure || channel.Type == constant.ChannelTypeCustom) {
-				known = true
-			}
-			if advanced != nil {
-				// The router excludes advanced routes with no matching incoming path.
-				// Check the first matching route, just as the actual adaptor does.
-				route, matched := advanced.MatchPathForModel(requestPath, ability.Model)
-				if !matched {
-					continue
-				}
-				supported = !(passThrough || route.PassThroughBodyEnabled) || route.SupportsPassThroughBody()
-			} else if messages {
-				supported = known && (apiType == constant.APITypeAnthropic || apiType == constant.APITypeNewAPI || apiType == constant.APITypeSub2API)
-				if !supported && !passThrough && known && (slices.Contains(endpoints, constant.EndpointTypeOpenAI) || slices.Contains(endpoints, constant.EndpointTypeAnthropic)) {
-					// Preferred endpoint lists are not a conversion capability matrix.
-					// These adaptors implement ConvertClaudeRequest; OpenAI converts
-					// messages to chat by default without a per-model switch.
-					switch apiType {
-					case constant.APITypeOpenAI, constant.APITypeOpenRouter, constant.APITypeXinference,
-						constant.APITypeGemini, constant.APITypeAli, constant.APITypeZhipuV4,
-						constant.APITypeOllama, constant.APITypePerplexity, constant.APITypeSiliconFlow,
-						constant.APITypeDeepSeek, constant.APITypeVolcEngine,
-						constant.APITypeBaiduV2, constant.APITypeMoonshot, constant.APITypeMiniMax:
-						supported = true
-					case constant.APITypeAws, constant.APITypeVertexAi:
-						// These adaptors dispatch other upstream models to Nova/Gemini
-						// while ConvertClaudeRequest always produces a Claude body.
-						// Do not infer the dispatch target across model-mapping chains.
-						unmapped := channel.ModelMapping == nil || strings.TrimSpace(*channel.ModelMapping) == "" || strings.TrimSpace(*channel.ModelMapping) == "{}"
-						supported = unmapped && strings.HasPrefix(ability.Model, "claude")
-						if apiType == constant.APITypeAws && unmapped {
-							supported = supported || strings.HasPrefix(ability.Model, "anthropic.claude") || strings.Contains(ability.Model, ".anthropic.claude")
-						}
+			supported = !(passThrough || route.PassThroughBodyEnabled) || route.SupportsPassThroughBody()
+		} else if messages {
+			// These adaptors route Claude bodies to a native messages endpoint;
+			// they do not require chat/envelope conversion even with passthrough.
+			supported = known && slices.Contains([]int{
+				constant.APITypeAnthropic, constant.APITypeNewAPI, constant.APITypeSub2API,
+				constant.APITypeDeepSeek, constant.APITypeMoonshot, constant.APITypeMiniMax,
+				constant.APITypeZhipuV4, constant.APITypeOllama,
+			}, apiType)
+			if !supported && !passThrough && known && (slices.Contains(endpoints, constant.EndpointTypeOpenAI) || slices.Contains(endpoints, constant.EndpointTypeAnthropic)) {
+				// Preferred endpoint lists are not a conversion capability matrix.
+				// These adaptors implement ConvertClaudeRequest; OpenAI converts
+				// messages to chat by default without a per-model switch.
+				switch apiType {
+				case constant.APITypeOpenAI, constant.APITypeOpenRouter, constant.APITypeXinference,
+					constant.APITypeGemini, constant.APITypeAli, constant.APITypeZhipuV4,
+					constant.APITypeOllama, constant.APITypePerplexity, constant.APITypeSiliconFlow,
+					constant.APITypeDeepSeek, constant.APITypeVolcEngine,
+					constant.APITypeBaiduV2, constant.APITypeMoonshot, constant.APITypeMiniMax:
+					supported = true
+				case constant.APITypeAws, constant.APITypeVertexAi:
+					// These adaptors dispatch other upstream models to Nova/Gemini
+					// while ConvertClaudeRequest always produces a Claude body.
+					// Do not infer the dispatch target across model-mapping chains.
+					unmapped := channel.ModelMapping == nil || strings.TrimSpace(*channel.ModelMapping) == "" || strings.TrimSpace(*channel.ModelMapping) == "{}"
+					supported = unmapped && strings.HasPrefix(ability.Model, "claude")
+					if apiType == constant.APITypeAws && unmapped {
+						supported = supported || strings.HasPrefix(ability.Model, "anthropic.claude") || strings.Contains(ability.Model, ".anthropic.claude")
 					}
 				}
-			} else {
-				supported = supported && known
-				if passThrough {
-					// A chat body must not bypass the conversion into Claude/Gemini
-					// or AWS/Vertex envelopes merely because chat is advertised.
-					supported = supported && (apiType == constant.APITypeOpenAI || apiType == constant.APITypeOpenRouter || apiType == constant.APITypeXinference || apiType == constant.APITypeNewAPI || apiType == constant.APITypeSub2API)
+			}
+		} else {
+			supported = supported && known
+			if passThrough {
+				// These adaptors use native OpenAI chat bodies at their chat endpoint.
+				// Field normalization is distinct from conversion into Claude/Gemini
+				// or AWS/Vertex envelopes, which raw-body passthrough cannot supply.
+				nativeChat := slices.Contains([]int{
+					constant.APITypeOpenAI, constant.APITypeOpenRouter, constant.APITypeXinference,
+					constant.APITypeNewAPI, constant.APITypeSub2API, constant.APITypeAli,
+					constant.APITypeZhipuV4, constant.APITypePerplexity, constant.APITypeSiliconFlow,
+					constant.APITypeMistral, constant.APITypeDeepSeek, constant.APITypeVolcEngine,
+					constant.APITypeBaiduV2, constant.APITypeXai, constant.APITypeMoonshot,
+					constant.APITypeSubmodel, constant.APITypeMiniMax, constant.APITypeCloudflare,
+				}, apiType)
+				if apiType == constant.APITypeOllama {
+					var settings dto.ChannelOtherSettings
+					nativeChat = common.UnmarshalJsonStr(channel.OtherSettings, &settings) == nil && settings.OllamaOpenAIChat
 				}
+				supported = supported && nativeChat
 			}
-			if !supported {
-				// Ordinary channels are not filtered by request path at selection.
-				// One working route cannot hide another randomly selectable failure.
-				blocked[ability.Model] = true
-			}
+		}
+		if !supported {
+			// Ordinary channels are not filtered by request path at selection.
+			// One working route cannot hide another randomly selectable failure.
+			blocked[ability.Model] = true
 		}
 		if supported {
 			available[ability.Model] = true
 		}
 	}
-	if tool != "workbuddy" {
-		for name := range blocked {
-			delete(available, name)
-		}
+	for name := range blocked {
+		delete(available, name)
 	}
 	if len(available) == 0 {
 		return nil, model.LinkFailure(409, "LINK_NO_MODELS", "No compatible model is currently available for this tool and price group")
